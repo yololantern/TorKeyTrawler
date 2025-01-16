@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import re
+import os
 from datetime import datetime
 import sqlalchemy as db
 from sqlalchemy.ext.declarative import declarative_base
@@ -13,18 +14,18 @@ drug_keywords = {
     "precursor": re.compile(r"\bprecursor\b", re.IGNORECASE),
     "heroin": re.compile(r"\bheroin\b", re.IGNORECASE),
     "cocaine": re.compile(r"\bcocaine\b", re.IGNORECASE),
-    
 }
 
 # SQLAlchemy setup
 Base = declarative_base()
 
-class DrugKeyword(Base):
-    __tablename__ = 'drug_keywords'
+class KeywordFound(Base):
+    __tablename__ = 'keywords_found'
     id = db.Column(db.Integer, primary_key=True)
     source_url = db.Column(db.String, nullable=False)
     keyword_name = db.Column(db.String, nullable=False)
     time_found = db.Column(db.DateTime, default=datetime.utcnow)
+    page_content = db.Column(db.Text, nullable=False)
 
 class PageLog(Base):
     __tablename__ = 'pagelog'
@@ -42,12 +43,13 @@ Session = sessionmaker(bind=engine)
 async def extract_keywords(page, source_url):
     content = await page.content()
     soup = BeautifulSoup(content, 'html.parser')
+    
     found_keywords = []
-
     # Check for drug-related keywords
     for keyword, pattern in drug_keywords.items():
         if pattern.search(str(soup)):
-            kw_record = DrugKeyword(source_url=source_url, keyword_name=keyword)
+            # Save the page content to a database
+            kw_record = KeywordFound(source_url=source_url, keyword_name=keyword, page_content=content)
             found_keywords.append(kw_record)
 
     return found_keywords
@@ -79,6 +81,11 @@ async def crawl(url, depth, visited, semaphore):
                         session.add(kw_record)
                     await log_page(url, 'success')
                     session.commit()
+
+                    # Save the entire contents of the page as a text file
+                    with open(f"{url.replace('http://', '').replace('https://', '').replace('/', '_')}.html", "w", encoding="utf-8") as file:
+                        file.write(kw_record.page_content)
+
             else:
                 await log_page(url, 'no_keywords')
 
@@ -107,12 +114,7 @@ async def main(seed_url, depth):
             if current_depth > 1:
                 to_crawl.extend([(link, current_depth - 1) for link in crawl_result[0]['links']])
 
-    for result in crawled:
-        print(f"URL: {result['url']}")
-        for kw_record in result['keywords']:
-            print(f"  Found keyword {kw_record.keyword_name} at {kw_record.time_found}")
-        print(f"  Links found on page: {len(result['links'])}\n")
-
+# Entry point for the program
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 drugKeywordCrawler.py <seed_url> [<depth>]")
