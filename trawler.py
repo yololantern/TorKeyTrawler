@@ -1,124 +1,96 @@
-import asyncio
-import sys
-import re
-import os
-from datetime import datetime
-import sqlalchemy as db
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from pyppeteer import launch
-from bs4 import BeautifulSoup
+import gc
+import datetime
+from selenium import webdriver
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-# Define patterns for drug-related keywords
-drug_keywords = {
-    "precursor": re.compile(r"\bprecursor\b", re.IGNORECASE),
-    "heroin": re.compile(r"\bheroin\b", re.IGNORECASE),
-    "cocaine": re.compile(r"\bcocaine\b", re.IGNORECASE),
-}
+# Configuration for Firefox to route through Tor
+def create_tor_browser():
+    options = Options()
+    options.headless = True  # Set to False for visible browser
+    profile = webdriver.FirefoxProfile()
 
-# SQLAlchemy setup
-Base = declarative_base()
+    # Set the Tor proxy
+    profile.set_preference("network.proxy.type", 1)
+    profile.set_preference("network.proxy.socks", "127.0.0.1")
+    profile.set_preference("network.proxy.socks_port", 9150)  # Adjust as necessary
+    profile.set_preference("network.proxy.socks_remote_dns", True)
 
-class KeywordFound(Base):
-    __tablename__ = 'keywords_found'
-    id = db.Column(db.Integer, primary_key=True)
-    source_url = db.Column(db.String, nullable=False)
-    keyword_name = db.Column(db.String, nullable=False)
-    time_found = db.Column(db.DateTime, default=datetime.utcnow)
-    page_content = db.Column(db.Text, nullable=False)
+    service = FirefoxService(executable_path='path/to/geckodriver')  # Adjust path to geckodriver
+    return webdriver.Firefox(service=service, options=options, firefox_profile=profile)
 
-class PageLog(Base):
-    __tablename__ = 'pagelog'
-    id = db.Column(db.Integer, primary_key=True)
-    url = db.Column(db.String, nullable=False)
-    status = db.Column(db.String, nullable=False)
-    error = db.Column(db.String, nullable=True)
-    time_logged = db.Column(db.DateTime, default=datetime.utcnow)
-
-# Initialize database engine
-engine = db.create_engine('sqlite:///drugKeywords.db')
-Base.metadata.create_all(engine)
-Session = sessionmaker(bind=engine)
-
-async def extract_keywords(page, source_url):
-    content = await page.content()
-    soup = BeautifulSoup(content, 'html.parser')
-    
-    found_keywords = []
-    # Check for drug-related keywords
-    for keyword, pattern in drug_keywords.items():
-        if pattern.search(str(soup)):
-            # Save the page content to a database
-            kw_record = KeywordFound(source_url=source_url, keyword_name=keyword, page_content=content)
-            found_keywords.append(kw_record)
-
+# Function to search for keywords in the content
+def search_keywords(content, keywords):
+    found_keywords = [kw for kw in keywords if kw in content.lower()]
     return found_keywords
 
-async def log_page(url, status, error=None):
-    with Session() as session:
-        page_log = PageLog(url=url, status=status, error=error)
-        session.add(page_log)
-        session.commit()
+# Function to extract table data
+def extract_table_data(browser):
+    table_data = []
+    try:
+        tables = browser.find_elements(By.CLASS_NAME, 'vtable')
+        for table in tables:
+            rows = table.find_elements(By.TAG_NAME, 'tr')[1:]  # Skip header
+            for row in rows:
+                columns = row.find_elements(By.TAG_NAME, 'td')
+                if len(columns) >= 3:
+                    vendor_name = columns[0].text.strip()
+                    ship_from = columns[1].text.strip()
+                    ship_to = columns[2].text.strip()
+                    table_data.append((vendor_name, ship_from, ship_to))
+    except Exception as e:
+        print(f"Error extracting table: {e}")
+    return table_data
 
-async def crawl(url, depth, visited, semaphore):
+# Main crawling function with memory management
+def crawl(url, keywords, depth, visited, browser):
     if depth == 0 or url in visited:
-        return []
+        return
 
     visited.add(url)
-    async with semaphore:
-        browser = await launch(headless=True,
-                               args=['--no-sandbox',
-                                     '--disable-setuid-sandbox',
-                                     '--proxy-server=socks5://127.0.0.1:9050'])
-        page = await browser.newPage()
-        try:
-            print(f"Visiting: {url}")
-            await page.goto(url, timeout=60000)
-            found_keywords = await extract_keywords(page, url)
-            if found_keywords:
-                with Session() as session:
-                    for kw_record in found_keywords:
-                        session.add(kw_record)
-                    await log_page(url, 'success')
-                    session.commit()
+    try:
+        browser.get(url)
 
-                    # Save the entire contents of the page as a text file
-                    with open(f"{url.replace('http://', '').replace('https://', '').replace('/', '_')}.html", "w", encoding="utf-8") as file:
-                        file.write(kw_record.page_content)
+        # Wait for page to fully load
+        WebDriverWait(browser, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        content = browser.page_source
 
-            else:
-                await log_page(url, 'no_keywords')
+        date_retrieved = datetime.datetime.now().isoformat()
+        found_keywords = search_keywords(content, keywords)
 
-            links = await page.evaluate('''() => Array.from(document.links).map(link => link.href)''')
-            print(f"Finished: {url}")
-            return [{"url": url, "keywords": found_keywords, "links": links}]
-        except Exception as e:
-            print(f"Failed to crawl {url}: {e}")
-            await log_page(url, 'failed', str(e))
-            return []
-        finally:
-            await page.close()
-            await browser.close()
+        if found_keywords:
+            print(f'Date Retrieved: {date_retrieved} | Keywords: {found_keywords} | URL: {url}')
+            table_data = extract_table_data(browser)
+            for vendor, from_location, to_location in table_data:
+                print(f'  Vendor: {vendor}, Ship From: {from_location}, Ship To: {to_location}')
+        
+        # Find links to crawl further
+        links = browser.find_elements(By.TAG_NAME, 'a')
+        for link in links:
+            link_url = link.get_attribute('href')
+            if link_url and link_url.startswith('http'):
+                crawl(link_url, keywords, depth-1, visited, browser)
 
-async def main(seed_url, depth):
-    to_crawl = [(seed_url, depth)]
-    crawled = []
-    visited = set()
-    semaphore = asyncio.Semaphore(4)  # Limit concurrent tasks to 4
+    except Exception as e:
+        print(f'Error processing {url}: {e}')
 
-    while to_crawl:
-        current_url, current_depth = to_crawl.pop()
-        crawl_result = await crawl(current_url, current_depth, visited, semaphore)
-        if crawl_result:
-            crawled.append(crawl_result[0])
-            if current_depth > 1:
-                to_crawl.extend([(link, current_depth - 1) for link in crawl_result[0]['links']])
-
-# Entry point for the program
+# Entry point
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 drugKeywordCrawler.py <seed_url> [<depth>]")
-        sys.exit(1)
-    seed_url = sys.argv[1]
-    depth = int(sys.argv[2]) if len(sys.argv) > 2 else 2
-    asyncio.get_event_loop().run_until_complete(main(seed_url, depth))
+    starting_url = 'http://example.onion'  # Replace with the actual starting URL
+    keywords = ['precursors', 'safroe', 'fentanyl']
+    depth = 2
+    visited = set()
+    
+    # Only create one instance of the browser to reuse
+    browser = create_tor_browser()
+
+    try:
+        crawl(starting_url, keywords, depth, visited, browser)
+    finally:
+        browser.quit()  # Ensure the browser closes properly
+
+    # Manual garbage collection
+    gc.collect()
